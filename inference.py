@@ -47,11 +47,27 @@ def main():
             else:
                 device = "cpu"
                 print("Chosen device: cpu")
+                
+    def log_vram_usage(label: str) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            free, total = torch.cuda.mem_get_info()
+            reserved = torch.cuda.memory_reserved()
+            allocated = torch.cuda.memory_allocated()
+            print(
+                f"[{label}] VRAM usage | total: {total / 1e9:.2f} GB, "
+                f"free: {free / 1e9:.2f} GB, reserved: {reserved / 1e9:.2f} GB, "
+                f"allocated: {allocated / 1e9:.2f} GB"
+            )
+        else:
+            print(f"[{label}] VRAM usage not available (CUDA not detected)")
+            
     # Load models
     components = load_from_local_dir(model_path, device=device, dtype=dtype, compile=compile)
     AttentionBackend.print_available_backends()
     set_attention_backend(attn_backend)
     print(f"Chosen attention backend: {attn_backend}")
+    log_vram_usage("post-model-load")
 
     # Gen an image
     start_time = time.time()
@@ -66,6 +82,7 @@ def main():
     )
     end_time = time.time()
     print(f"Time taken: {end_time - start_time:.2f} seconds")
+    log_vram_usage("post-generation")
     images[0].save(output_path)
 
     ### !! For best speed performance, recommend to use `_flash_3` backend and set `compile=True`
