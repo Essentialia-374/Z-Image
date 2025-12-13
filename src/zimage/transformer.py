@@ -64,7 +64,7 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-class FeedForwardHiddenTiled(nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, tile_hidden=1024):
         super().__init__()
         self.dim = dim
@@ -177,7 +177,7 @@ class ZImageTransformerBlock(nn.Module):
         self.modulation = modulation
 
         self.attention = ZImageAttention(dim, n_heads, n_kv_heads, qk_norm, norm_eps)
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
+        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8), tile_hidden=1024)
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
