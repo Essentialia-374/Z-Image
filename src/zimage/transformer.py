@@ -1,5 +1,6 @@
 """Z-Image Transformer."""
 
+import os
 import math
 from typing import List, Optional, Tuple
 
@@ -7,6 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+
+_LINEAR_ATTN_DEFAULT_FEATURES = int(os.environ.get("ZIMAGE_LINEAR_ATTN_FEATURES", "128"))
+_LINEAR_ATTN_SEED = int(os.environ.get("ZIMAGE_LINEAR_ATTN_SEED", "0"))
+_LINEAR_ATTN_EPS = float(os.environ.get("ZIMAGE_LINEAR_ATTN_EPS", "1e-6"))
 
 from config import (
     ADALN_EMBED_DIM,
@@ -82,6 +87,162 @@ def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
         x_out = torch.view_as_real(x * freqs_cis).flatten(3)
         return x_out.type_as(x_in)
 
+def _as_key_padding_mask(
+    attn_mask: Optional[torch.Tensor],
+    b: int,
+    s: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Convert an attention mask to a (B, S) bool mask where True = valid token."""
+    if attn_mask is None:
+        return None
+
+    m = attn_mask
+
+    # Normalize common broadcasted shapes to (B, S).
+    if m.dim() == 4 and m.shape[-1] == s:      # (B, 1, 1, S)
+        m = m[:, 0, 0, :]
+    elif m.dim() == 3 and m.shape[-1] == s:    # (B, 1, S)
+        m = m[:, 0, :]
+    elif m.dim() != 2:
+        raise ValueError(f"Unsupported attention_mask shape: {tuple(attn_mask.shape)}")
+
+    if m.shape != (b, s):
+        raise ValueError(f"attention_mask shape {tuple(m.shape)} does not match (B,S)=({b},{s})")
+
+    if m.dtype == torch.bool:
+        return m.to(device=device)
+
+    return (m > 0).to(device=device)
+
+
+def _gaussian_orthogonal_random_matrix(
+    nb_rows: int,
+    nb_cols: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create a (nb_rows, nb_cols) float32 orthogonal random features matrix (Performer/FAVOR+)."""
+    # Generate on CPU for deterministic results across CPU/CUDA RNG.
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+
+    nb_full_blocks = nb_rows // nb_cols
+    blocks = []
+
+    for _ in range(nb_full_blocks):
+        a = torch.randn((nb_cols, nb_cols), generator=gen, device="cpu", dtype=torch.float32)
+        q, _ = torch.linalg.qr(a, mode="reduced")
+        blocks.append(q.T)
+
+    remaining = nb_rows - nb_full_blocks * nb_cols
+    if remaining > 0:
+        a = torch.randn((nb_cols, nb_cols), generator=gen, device="cpu", dtype=torch.float32)
+        q, _ = torch.linalg.qr(a, mode="reduced")
+        blocks.append(q.T[:remaining])
+
+    mat = torch.cat(blocks, dim=0)
+
+    # Row-wise scaling (chi-like).
+    row_norms = torch.randn((nb_rows, nb_cols), generator=gen, device="cpu", dtype=torch.float32).norm(dim=1)
+    mat = mat * row_norms[:, None]
+
+    return mat.to(device=device)
+
+
+def _favor_feature_map(
+    x: torch.Tensor,
+    projection: torch.Tensor,
+    is_query: bool,
+    eps: float,
+) -> torch.Tensor:
+    """FAVOR+ positive random features. x: (B,H,S,D), projection: (M,D) -> (B,H,S,M)."""
+    b, h, s, d = x.shape
+    m = projection.shape[0]
+
+    x = x * (d ** -0.25)
+    x_proj = torch.einsum("bhsd,md->bhsm", x, projection)
+
+    x_sq = 0.5 * (x * x).sum(dim=-1, keepdim=True)
+    x_proj = x_proj - x_sq
+
+    # Stabilize exponentials.
+    if is_query:
+        x_proj = x_proj - x_proj.amax(dim=-1, keepdim=True)
+    else:
+        x_proj = x_proj - x_proj.amax(dim=2, keepdim=True)
+
+    x_phi = torch.exp(x_proj) * (m ** -0.5)
+    return x_phi + eps
+
+
+def linear_attention_favor(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    *,
+    num_features: int = _LINEAR_ATTN_DEFAULT_FEATURES,
+    seed: int = _LINEAR_ATTN_SEED,
+    eps: float = _LINEAR_ATTN_EPS,
+    projection_cache: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FAVOR+ linear attention. Returns (B, S, H, D)."""
+    b, s, h, d = q.shape
+    _, _, hk, dk = k.shape
+    assert dk == d, "k head_dim mismatch"
+    assert v.shape == (b, s, hk, d), "v shape mismatch"
+
+    # Expand KV heads for GQA.
+    if hk != h:
+        if h % hk != 0:
+            raise ValueError(f"Cannot expand kv heads: n_heads={h}, n_kv_heads={hk}")
+        rep = h // hk
+        k = k.repeat_interleave(rep, dim=2)
+        v = v.repeat_interleave(rep, dim=2)
+
+    q_bhsd = q.permute(0, 2, 1, 3)
+    k_bhsd = k.permute(0, 2, 1, 3)
+    v_bhsd = v.permute(0, 2, 1, 3)
+
+    valid = _as_key_padding_mask(attention_mask, b=b, s=s, device=q.device)
+    valid_f = valid.to(dtype=q_bhsd.dtype).unsqueeze(1).unsqueeze(-1) if valid is not None else None
+
+    # Use float32 for stability (exp).
+    q32, k32, v32 = q_bhsd.float(), k_bhsd.float(), v_bhsd.float()
+
+    if projection_cache is not None:
+        proj = projection_cache
+        if proj.device != q.device or proj.dtype != torch.float32 or proj.shape != (num_features, d):
+            raise ValueError("projection_cache has wrong device/dtype/shape")
+    else:
+        proj = _gaussian_orthogonal_random_matrix(
+            num_features,
+            d,
+            seed=seed + 1009 * d + 9176 * num_features,
+            device=q.device,
+        )
+
+    q_phi = _favor_feature_map(q32, proj, is_query=True, eps=eps)
+    k_phi = _favor_feature_map(k32, proj, is_query=False, eps=eps)
+
+    if valid_f is not None:
+        vf32 = valid_f.float()
+        k_phi = k_phi * vf32
+        v32 = v32 * vf32
+
+    kv = torch.einsum("bhsm,bhsd->bhmd", k_phi, v32)
+    k_sum = k_phi.sum(dim=2)
+
+    out = torch.einsum("bhsm,bhmd->bhsd", q_phi, kv)
+    denom = torch.einsum("bhsm,bhm->bhs", q_phi, k_sum).unsqueeze(-1)
+    out = out / (denom + eps)
+
+    if valid is not None:
+        out = out * valid.to(dtype=out.dtype).unsqueeze(1).unsqueeze(-1)
+
+    return out.to(dtype=q.dtype).permute(0, 2, 1, 3).contiguous()
+
 
 class ZImageAttention(nn.Module):
     _attention_backend = None
@@ -126,11 +287,12 @@ class ZImageAttention(nn.Module):
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
 
-        # Dispatch
-        from utils.attention import dispatch_attention
-
-        hidden_states = dispatch_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False, backend=self._attention_backend
+        hidden_states = linear_attention_favor(
+            query, 
+            key, 
+            value, 
+            attention_mask=attention_mask,
+            num_features=128 
         )
 
         hidden_states = hidden_states.flatten(2, 3)
