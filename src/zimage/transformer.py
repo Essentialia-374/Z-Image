@@ -7,6 +7,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+from types import SimpleNamespace
+
+import inspect
+from dataclasses import dataclass
+
+from liger_kernel.transformers.rms_norm import LigerRMSNorm
+from liger_kernel.transformers.layer_norm import LigerLayerNorm
+from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+from liger_kernel.transformers.rope import liger_rotary_pos_emb
 
 from config import (
     ADALN_EMBED_DIM,
@@ -17,7 +26,6 @@ from config import (
     ROPE_THETA,
     SEQ_MULTI_OF,
 )
-
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=FREQUENCY_EMBEDDING_SIZE):
@@ -53,27 +61,59 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+RMSNorm = LigerRMSNorm
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return output * self.weight
+
+def _freqs_cis_to_cos_sin(freqs_cis: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    # freqs_cis: (B, S, D/2) complex -> (B, S, D) real cos/sin (HF-style)
+    cos = torch.repeat_interleave(freqs_cis.real, 2, dim=-1).to(dtype)
+    sin = torch.repeat_interleave(freqs_cis.imag, 2, dim=-1).to(dtype)
+    return cos.contiguous(), sin.contiguous()
+
+
+_ROPE_SIG = inspect.signature(liger_rotary_pos_emb)
+_ROPE_PARAMS = list(_ROPE_SIG.parameters.keys())
+
+
+def apply_liger_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    B, S, H, D = q.shape
+    q = q.transpose(1, 2).contiguous() 
+    k = k.transpose(1, 2).contiguous()
+
+    cos_tok, sin_tok = _freqs_cis_to_cos_sin(freqs_cis, dtype=q.dtype) 
+    
+    if "position_ids" in _ROPE_PARAMS:
+        cos_cache = cos_tok.reshape(B * S, D).contiguous()
+        sin_cache = sin_tok.reshape(B * S, D).contiguous()
+        position_ids = torch.arange(B * S, device=q.device, dtype=torch.long).view(B, S)
+
+        kwargs = {"position_ids": position_ids}
+        if "unsqueeze_dim" in _ROPE_SIG.parameters:
+            kwargs["unsqueeze_dim"] = 1
+        q, k = liger_rotary_pos_emb(q, k, cos_cache, sin_cache, **kwargs)
+    else:
+        cos = cos_tok.unsqueeze(1) 
+        sin = sin_tok.unsqueeze(1)
+        q, k = liger_rotary_pos_emb(q, k, cos, sin)
+
+    return q.transpose(1, 2), k.transpose(1, 2) 
 
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        @dataclass
+        class _Cfg:
+            hidden_size: int
+            intermediate_size: int
+            hidden_act: str = "silu"
+            mlp_bias: bool = False
+            bias: bool = False
+
+        self.mlp = LigerSwiGLUMLP(_Cfg(hidden_size=dim, intermediate_size=hidden_dim))
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
+         return self.mlp(x)
 
 def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     with torch.amp.autocast("cuda", enabled=False):
@@ -120,9 +160,8 @@ class ZImageAttention(nn.Module):
             key = self.norm_k(key)
 
         if freqs_cis is not None:
-            query = apply_rotary_emb(query, freqs_cis)
-            key = apply_rotary_emb(key, freqs_cis)
-
+            query, key = apply_liger_rope(query, key, freqs_cis)
+            
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
 
@@ -205,7 +244,16 @@ class ZImageTransformerBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        ln_sig = inspect.signature(LigerLayerNorm.__init__)
+        ln_params = ln_sig.parameters
+        ln_kwargs = {}
+        if "eps" in ln_params:
+            ln_kwargs["eps"] = 1e-6
+        if "elementwise_affine" in ln_params:
+            ln_kwargs["elementwise_affine"] = False
+        if "bias" in ln_params:
+            ln_kwargs["bias"] = False
+        self.norm_final = LigerLayerNorm(hidden_size, **ln_kwargs)
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
