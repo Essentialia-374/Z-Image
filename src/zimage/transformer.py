@@ -64,15 +64,34 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+class FeedForwardHiddenTiled(nn.Module):
+    def __init__(self, dim, hidden_dim, tile_hidden=1024):
         super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.tile_hidden = tile_hidden
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
+    @torch.inference_mode()
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        B, S, D = x.shape
+        y = torch.zeros((B, S, D), device=x.device, dtype=x.dtype)
+
+        for k0 in range(0, self.hidden_dim, self.tile_hidden):
+            k1 = min(k0 + self.tile_hidden, self.hidden_dim)
+            
+            w1_blk = self.w1.weight[k0:k1, :]
+            w3_blk = self.w3.weight[k0:k1, :]
+            w2_blk = self.w2.weight[:, k0:k1]
+
+            a = F.linear(x, w1_blk)
+            F.silu(a, inplace=True)
+            a.mul_(F.linear(x, w3_blk))
+            y.add_(F.linear(a, w2_blk))
+
+        return y
 
 
 def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
