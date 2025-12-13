@@ -65,33 +65,14 @@ class RMSNorm(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, tile_hidden=1024):
+    def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.dim = dim
-        self.hidden_dim = hidden_dim
-        self.tile_hidden = tile_hidden
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
-    @torch.inference_mode()
     def forward(self, x):
-        B, S, D = x.shape
-        y = torch.zeros((B, S, D), device=x.device, dtype=x.dtype)
-
-        for k0 in range(0, self.hidden_dim, self.tile_hidden):
-            k1 = min(k0 + self.tile_hidden, self.hidden_dim)
-            
-            w1_blk = self.w1.weight[k0:k1, :]
-            w3_blk = self.w3.weight[k0:k1, :]
-            w2_blk = self.w2.weight[:, k0:k1]
-
-            a = F.linear(x, w1_blk)
-            F.silu(a, inplace=True)
-            a.mul_(F.linear(x, w3_blk))
-            y.add_(F.linear(a, w2_blk))
-
-        return y
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -177,7 +158,7 @@ class ZImageTransformerBlock(nn.Module):
         self.modulation = modulation
 
         self.attention = ZImageAttention(dim, n_heads, n_kv_heads, qk_norm, norm_eps)
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8), tile_hidden=1024)
+        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
